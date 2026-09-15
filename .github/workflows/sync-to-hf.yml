@@ -6,6 +6,9 @@ on:
 
 jobs:
   sync-to-hub:
+    # This workflow publishes the upstream project's Hugging Face Space.
+    # Forks have neither the destination ownership nor its HF_TOKEN.
+    if: github.repository == 'yxc20089/OpenRA-RL'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
