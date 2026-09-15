@@ -17,5 +17,7 @@ tests/
 docs/
 *.pdf
 .claude/
-# OpenRA submodule (cloned from GitHub during Docker build)
-OpenRA/
+# The default Dockerfile clones OpenRA remotely. Dockerfile.platform instead
+# consumes the pinned submodule so its Python bridge and engine cannot drift.
+!OpenRA/
+!OpenRA/**

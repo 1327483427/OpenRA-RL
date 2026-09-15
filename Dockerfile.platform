@@ -1,0 +1,53 @@
+# Build a version-locked OpenRA AI platform from this repository checkout.
+FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS openra-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    make git libsdl2-dev libopenal-dev libfreetype-dev liblua5.1-0-dev ca-certificates \
+    protobuf-compiler protobuf-compiler-grpc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/openra
+COPY OpenRA/ ./
+RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + \
+    && find . -name '*.sh' -exec chmod +x {} + \
+    && dotnet restore -p:TargetPlatform=unix-generic \
+    && platform_arch="$(uname -m)" \
+    && case "$platform_arch" in \
+        x86_64|amd64) grpc_tools_arch=linux_x64 ;; \
+        aarch64|arm64) grpc_tools_arch=linux_arm64 ;; \
+        *) echo "Unsupported build architecture: $platform_arch" >&2; exit 1 ;; \
+       esac \
+    && /usr/bin/protoc \
+        -I OpenRA.Mods.Common/Traits/Player/Protos \
+        --csharp_out=OpenRA.Mods.Common/Traits/Player/Protos/Generated \
+        --grpc_out=OpenRA.Mods.Common/Traits/Player/Protos/Generated \
+        --plugin=protoc-gen-grpc=/root/.nuget/packages/grpc.tools/2.69.0/tools/$grpc_tools_arch/grpc_csharp_plugin \
+        OpenRA.Mods.Common/Traits/Player/Protos/rl_bridge.proto \
+    && SKIP_PROTOC=true make TARGETPLATFORM=unix-generic CONFIGURATION=Release \
+    && test -f bin/OpenRA.dll \
+    && test -f bin/OpenRA.Mods.Common.dll \
+    && test -f bin/OpenRA.Platforms.Null.dll
+
+FROM ghcr.io/yxc20089/openra-rl:latest
+
+# Replace the older published engine with the exact submodule revision used by
+# this checkout, then install the matching Python platform and dependency pins.
+COPY --from=openra-build /src/openra/bin /opt/openra/bin
+COPY --from=openra-build /src/openra/mods /opt/openra/mods
+COPY --from=openra-build /src/openra/glsl /opt/openra/glsl
+COPY --from=openra-build ["/src/openra/global mix database.dat", "/opt/openra/global mix database.dat"]
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY openra_env/ ./openra_env/
+COPY proto/ ./proto/
+RUN pip install --no-cache-dir .
+
+ENV OPENRA_PATH=/opt/openra
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV DISPLAY=:99
+ENV RECORD_REPLAYS=true
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python", "-m", "openra_env.server.app"]

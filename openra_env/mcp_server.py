@@ -12,6 +12,12 @@ Works with OpenClaw, Claude Desktop, and any MCP client.
 
 import json
 import logging
+import asyncio
+import os
+import time
+import urllib.parse
+import urllib.request
+import uuid
 from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -23,6 +29,8 @@ logger = logging.getLogger("openra-rl-mcp")
 _client = None
 _server_url = "http://localhost:8000"
 _game_started = False
+_agent_session_id = str(uuid.uuid4())
+_agent_name = os.environ.get("OPENRA_AGENT_NAME", "external-mcp-agent")
 
 mcp = FastMCP(
     "openra-rl",
@@ -41,6 +49,47 @@ async def _get_client():
     return _client
 
 
+def _http_json(path: str) -> Any:
+    request = urllib.request.Request(f"{_server_url.rstrip('/')}{path}")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _post_event_sync(event: dict[str, Any]) -> None:
+    payload = {
+        "source": "mcp",
+        "agent": _agent_name,
+        "session_id": _agent_session_id,
+        **event,
+    }
+    request = urllib.request.Request(
+        f"{_server_url.rstrip('/')}/platform/events",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=3):
+        pass
+
+
+async def _publish_event(event: dict[str, Any]) -> None:
+    """Best-effort event publishing; monitoring must never block gameplay."""
+    try:
+        await asyncio.to_thread(_post_event_sync, event)
+    except Exception:
+        logger.debug("Could not publish platform event", exc_info=True)
+
+
+async def _reset_game(**kwargs: Any) -> dict:
+    global _game_started
+    client = await _get_client()
+    await _publish_event({"event": "game_starting", "configuration": kwargs})
+    result = await client.reset(**kwargs)
+    _game_started = True
+    await _publish_event({"event": "game_started", "configuration": kwargs, "result": result})
+    return result
+
+
 async def _ensure_game() -> None:
     """Ensure game server is running and a game is started."""
     global _game_started
@@ -54,9 +103,7 @@ async def _ensure_game() -> None:
     try:
         req = urllib.request.urlopen(f"{_server_url}/health", timeout=3)
         if req.status == 200:
-            client = await _get_client()
-            await client.reset()
-            _game_started = True
+            await _reset_game()
             return
     except (urllib.error.URLError, OSError):
         pass
@@ -81,16 +128,34 @@ async def _ensure_game() -> None:
             "Start it manually: docker run -p 8000:8000 ghcr.io/yxc20089/openra-rl:latest"
         )
 
-    client = await _get_client()
-    await client.reset()
-    _game_started = True
+    await _reset_game()
 
 
-async def _call(tool_name: str, **kwargs) -> Any:
-    """Call a game tool and return the result."""
+async def _call(tool_name: str, *, event_tool: Optional[str] = None, **kwargs) -> Any:
+    """Call a game tool, recording the action for the control dashboard."""
     await _ensure_game()
     client = await _get_client()
-    return await client.call_tool(tool_name, **kwargs)
+    started_at = time.monotonic()
+    displayed_tool = event_tool or tool_name
+    await _publish_event({"event": "tool_call", "tool": displayed_tool, "arguments": kwargs})
+    try:
+        result = await client.call_tool(tool_name, **kwargs)
+    except Exception as exc:
+        await _publish_event({
+            "event": "tool_error",
+            "tool": displayed_tool,
+            "arguments": kwargs,
+            "error": str(exc),
+            "duration_ms": round((time.monotonic() - started_at) * 1000),
+        })
+        raise
+    await _publish_event({
+        "event": "tool_result",
+        "tool": displayed_tool,
+        "result": result,
+        "duration_ms": round((time.monotonic() - started_at) * 1000),
+    })
+    return result
 
 
 def _format(result: Any) -> str:
@@ -103,12 +168,30 @@ def _format(result: Any) -> str:
 # ── Game Lifecycle ─────────────────────────────────────────────────
 
 @mcp.tool()
-async def start_game() -> str:
-    """Start a new Red Alert game. Returns initial game state."""
-    global _game_started
-    _game_started = False
-    await _ensure_game()
-    state = await _call("get_game_state")
+async def list_maps(
+    mod: Annotated[str, Field(description="OpenRA mod. Currently 'ra' is fully supported.")] = "ra",
+    include_campaigns: Annotated[bool, Field(description="Include unpacked campaign missions as well as skirmish maps.")] = False,
+) -> str:
+    """List installed OpenRA maps that can be selected for a new game."""
+    query = urllib.parse.urlencode({"mod": mod, "include_campaigns": str(include_campaigns).lower()})
+    return _format(await asyncio.to_thread(_http_json, f"/platform/maps?{query}"))
+
+
+@mcp.tool()
+async def get_platform_status() -> str:
+    """Get server, active mod, map-count, and monitoring information."""
+    return _format(await asyncio.to_thread(_http_json, "/platform/status"))
+
+
+@mcp.tool()
+async def start_game(
+    map_name: Annotated[str, Field(description="Installed map filename returned by list_maps, for example 'singles.oramap'.")] = "singles.oramap",
+    difficulty: Annotated[str, Field(description="Opponent: beginner, easy, medium, hard, brutal, rush, normal, turtle, or naval.")] = "beginner",
+    seed: Annotated[int, Field(description="Deterministic random seed; use 0 for the default.")] = 0,
+) -> str:
+    """Start a configurable Red Alert game and return its initial state."""
+    await _reset_game(map_name=map_name, bot_type=difficulty, seed=seed)
+    state = await _call("get_game_state", event_tool="start_game_state")
     return _format(state)
 
 
@@ -134,31 +217,45 @@ async def advance(
 @mcp.tool()
 async def get_economy() -> str:
     """Get economy info: cash, ore, power, harvesters."""
-    return _format(await _call("get_economy"))
+    state = await _call("get_game_state", event_tool="get_economy")
+    return _format(state.get("economy", {}))
 
 
 @mcp.tool()
 async def get_units() -> str:
     """Get list of your units with positions, health, type."""
-    return _format(await _call("get_units"))
+    state = await _call("get_game_state", event_tool="get_units")
+    return _format({"count": state.get("own_units", 0), "units": state.get("units_summary", [])})
 
 
 @mcp.tool()
 async def get_buildings() -> str:
     """Get list of your buildings with positions, production, power."""
-    return _format(await _call("get_buildings"))
+    state = await _call("get_game_state", event_tool="get_buildings")
+    return _format({
+        "count": state.get("own_buildings", 0),
+        "buildings": state.get("buildings_summary", []),
+    })
 
 
 @mcp.tool()
 async def get_enemies() -> str:
     """Get visible enemy units and buildings."""
-    return _format(await _call("get_enemies"))
+    state = await _call("get_game_state", event_tool="get_enemies")
+    return _format({
+        "units": state.get("enemy_summary", []),
+        "buildings": state.get("enemy_buildings_summary", []),
+    })
 
 
 @mcp.tool()
 async def get_production() -> str:
     """Get current production queue and available builds."""
-    return _format(await _call("get_production"))
+    state = await _call("get_game_state", event_tool="get_production")
+    return _format({
+        "items": state.get("production_items", []),
+        "available": state.get("available_production", []),
+    })
 
 
 @mcp.tool()

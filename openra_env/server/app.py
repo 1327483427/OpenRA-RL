@@ -21,6 +21,8 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from openenv.core.env_server import create_app
 
 from openra_env.models import OpenRAAction, OpenRAObservation
+from openra_env.platform_catalog import GAME_MODES, available_mods, discover_maps
+from openra_env.platform_events import AgentEventHub
 # grpc_worker removed: per-session gRPC channels eliminate HTTP/2 contention
 from openra_env.server.openra_environment import OpenRAEnvironment
 from openra_env.server.openra_process import OpenRAConfig, OpenRAProcessManager
@@ -31,6 +33,7 @@ from openra_env.server.openra_process import OpenRAConfig, OpenRAProcessManager
 _multi_session = True
 _base_grpc_port = int(os.getenv("GRPC_BASE_PORT", "9999"))
 _max_concurrent = int(os.getenv("MAX_CONCURRENT_GAMES", "64"))
+_platform_events = AgentEventHub(max_events=1000)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1223,6 +1226,93 @@ fetch('try-status')
 </html>"""
 
 
+CONTROL_PAGE = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenRA AI Control Center</title>
+<style>
+:root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #070907; color: #d6e3d6; }
+header { padding: 22px 28px; border-bottom: 1px solid #293229; background: #0c100c; }
+h1 { margin: 0; color: #f05252; letter-spacing: .08em; font-size: 24px; }
+.sub { color: #8ea18e; margin-top: 8px; }
+main { padding: 20px; display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 18px; }
+.panel { border: 1px solid #293229; background: #0c100c; border-radius: 8px; overflow: hidden; }
+.panel h2 { margin: 0; padding: 13px 15px; font-size: 14px; color: #b7ff72; border-bottom: 1px solid #293229; }
+.body { padding: 14px; }
+.metric { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px dotted #253025; }
+.metric span:first-child { color: #829482; }
+.ok { color: #63d471; } .bad { color: #ff6b6b; }
+select, button { width: 100%; margin-top: 9px; padding: 9px; color: #d6e3d6; background: #121812; border: 1px solid #354335; }
+#maps { max-height: 340px; overflow: auto; margin-top: 8px; }
+.map { padding: 7px 4px; border-bottom: 1px solid #1c251c; font-size: 12px; }
+.map small { color: #718271; display: block; margin-top: 3px; }
+.events { height: calc(100vh - 150px); overflow: auto; padding: 10px; }
+.event { border-left: 3px solid #3d583d; margin: 0 0 9px; padding: 9px 11px; background: #0a0d0a; }
+.event.tool_call { border-color: #f0b429; } .event.tool_result { border-color: #63d471; }
+.event.tool_error { border-color: #f05252; } .event.game_started { border-color: #4ba3ff; }
+.event-head { display: flex; gap: 10px; flex-wrap: wrap; color: #9fb39f; font-size: 12px; }
+.event-head strong { color: #e7f4e7; }
+pre { margin: 7px 0 0; white-space: pre-wrap; word-break: break-word; color: #aabaaa; font-size: 11px; max-height: 180px; overflow: auto; }
+a { color: #8dc7ff; }
+@media (max-width: 800px) { main { grid-template-columns: 1fr; } .events { height: 60vh; } }
+</style>
+</head>
+<body>
+<header><h1>OPENRA AI CONTROL CENTER</h1><div class="sub">Live activity from Claude Code, CC-Switch, and other MCP clients</div></header>
+<main>
+  <aside>
+    <section class="panel"><h2>PLATFORM</h2><div class="body" id="status">Loading...</div></section>
+    <section class="panel" style="margin-top:18px"><h2>MAP CATALOG</h2><div class="body">
+      <select id="mod"></select>
+      <label><input id="campaigns" type="checkbox"> Include campaign missions</label>
+      <div id="maps"></div>
+    </div></section>
+  </aside>
+  <section class="panel"><h2>AGENT ACTIVITY <span id="connection" class="bad">CONNECTING</span></h2><div id="events" class="events"></div></section>
+</main>
+<script>
+const events = document.getElementById('events');
+function esc(v) { return String(v).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function addEvent(e) {
+  const row = document.createElement('div'); row.className = 'event ' + (e.event || '');
+  const when = new Date((e.timestamp || 0) * 1000).toLocaleTimeString();
+  const detail = e.arguments || e.configuration || e.result || e.error || {};
+  row.innerHTML = `<div class="event-head"><span>${esc(when)}</span><strong>${esc(e.event || 'event')}</strong><span>${esc(e.agent || e.source || '')}</span><span>${esc(e.tool || '')}</span><span>${esc(e.duration_ms ? e.duration_ms + 'ms' : '')}</span></div><pre>${esc(JSON.stringify(detail, null, 2))}</pre>`;
+  events.appendChild(row); events.scrollTop = events.scrollHeight;
+}
+async function loadStatus() {
+  const s = await fetch('platform/status').then(r => r.json());
+  document.getElementById('status').innerHTML = [
+    ['Status', s.status], ['Active mod', s.active_mod], ['Maps', s.map_count],
+    ['Daemon', s.daemon_alive ? 'running' : 'stopped'], ['gRPC port', s.grpc_port],
+    ['Recorded events', s.event_count]
+  ].map(x => `<div class="metric"><span>${esc(x[0])}</span><span>${esc(x[1])}</span></div>`).join('') + '<p><a href="docs">REST API</a> · <a href="try">Built-in demo</a></p>';
+  const select = document.getElementById('mod');
+  if (!select.options.length) { s.installed_mods.forEach(m => select.add(new Option(m, m))); select.value = s.active_mod; }
+}
+async function loadMaps() {
+  const mod = document.getElementById('mod').value || 'ra';
+  const campaigns = document.getElementById('campaigns').checked;
+  const data = await fetch(`platform/maps?mod=${encodeURIComponent(mod)}&include_campaigns=${campaigns}`).then(r => r.json());
+  document.getElementById('maps').innerHTML = data.maps.map(m => `<div class="map"><b>${esc(m.title)}</b><small>${esc(m.map_name)} · ${esc(m.kind)}${m.players ? ' · ' + m.players + ' players' : ''}</small></div>`).join('');
+}
+document.getElementById('mod').addEventListener('change', loadMaps);
+document.getElementById('campaigns').addEventListener('change', loadMaps);
+Promise.all([loadStatus(), fetch('platform/events?limit=200').then(r => r.json()).then(d => d.events.forEach(addEvent))]).then(loadMaps);
+const stream = new EventSource('platform/events/stream');
+stream.onopen = () => { const e = document.getElementById('connection'); e.textContent = 'LIVE'; e.className = 'ok'; };
+stream.onmessage = event => { addEvent(JSON.parse(event.data)); loadStatus(); };
+stream.onerror = () => { const e = document.getElementById('connection'); e.textContent = 'RECONNECTING'; e.className = 'bad'; };
+</script>
+</body>
+</html>"""
+
+
 
 
 def register_routes(app):
@@ -1244,6 +1334,87 @@ def register_routes(app):
     def health_check():
         """Lightweight health check for web/container probes."""
         return {"status": "healthy"}
+
+    @app.get("/platform/status")
+    def platform_status():
+        """Describe the AI control platform and currently loaded engine."""
+        active_mod = _daemon.config.mod
+        maps = discover_maps(_openra_path, active_mod)
+        daemon_alive = _daemon.is_alive()
+        grpc_ok = False
+        if daemon_alive:
+            try:
+                channel = grpc.insecure_channel(f"localhost:{_current_grpc_port()}")
+                grpc.channel_ready_future(channel).result(timeout=1.0)
+                grpc_ok = True
+                channel.close()
+            except Exception:
+                pass
+        return {
+            "status": "ready" if grpc_ok else "degraded",
+            "active_mod": active_mod,
+            "installed_mods": available_mods(_openra_path),
+            "map_count": len(maps),
+            "game_modes": list(GAME_MODES),
+            "daemon_alive": daemon_alive,
+            "grpc_ok": grpc_ok,
+            "grpc_port": _current_grpc_port(),
+            "event_count": len(_platform_events.recent(1000)),
+            "control_url": "/control",
+        }
+
+    @app.get("/platform/maps")
+    def platform_maps(
+        mod: str = Query("ra", description="Installed OpenRA mod"),
+        include_campaigns: bool = Query(False, description="Include campaign map directories"),
+    ):
+        """List selectable maps from the installed OpenRA tree."""
+        installed = available_mods(_openra_path)
+        if mod not in installed:
+            raise HTTPException(status_code=400, detail=f"Mod '{mod}' is not installed; choose one of {installed}")
+        maps = discover_maps(_openra_path, mod, include_campaigns=include_campaigns)
+        return {"mod": mod, "count": len(maps), "maps": maps}
+
+    @app.get("/platform/events")
+    def platform_event_history(
+        limit: int = Query(200, ge=0, le=1000),
+    ):
+        """Return recent external-agent actions and results."""
+        events = _platform_events.recent(limit)
+        return {"count": len(events), "events": events}
+
+    @app.post("/platform/events")
+    async def publish_platform_event(event: dict):
+        """Receive a sanitized event from a local MCP bridge."""
+        return _platform_events.publish(event)
+
+    @app.delete("/platform/events")
+    def clear_platform_events():
+        """Clear the in-memory activity history."""
+        _platform_events.clear()
+        return {"status": "cleared"}
+
+    @app.get("/platform/events/stream")
+    async def stream_platform_events():
+        """Stream external-agent activity as Server-Sent Events."""
+        queue = _platform_events.subscribe()
+
+        async def stream():
+            try:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                        yield f"data: {json.dumps(event)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                _platform_events.unsubscribe(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/daemon-health")
     def daemon_health():
@@ -1419,6 +1590,11 @@ def register_routes(app):
     async def try_page():
         """Interactive page to watch an LLM agent play Red Alert."""
         return TRY_PAGE
+
+    @app.get("/control", response_class=HTMLResponse)
+    async def control_page():
+        """Monitor Claude Code, CC-Switch, and other external MCP agents."""
+        return CONTROL_PAGE
 
 
 _app = None
