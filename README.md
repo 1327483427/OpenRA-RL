@@ -295,6 +295,185 @@ The replay viewer runs inside Docker using the same engine that recorded the gam
 
 > **Version tracking:** Each replay records which Docker image version was used. When you upgrade, old replays are still viewable using their original engine version.
 
+## Windows / WSL2 AI Platform Setup
+
+Windows users should run the platform inside **WSL2 Ubuntu** with the Docker
+Desktop WSL backend. Native Windows Python is not recommended: the build and
+runtime scripts target Linux containers, and the MCP bridge is tested in that
+environment.
+
+Keep the repository inside the WSL filesystem (for example
+`~/Workspace/OpenRA-RL`) instead of `/mnt/c` or `/mnt/d`. Building the OpenRA
+source tree from a mounted Windows drive is substantially slower.
+
+### 1. Install WSL2
+
+Run PowerShell as Administrator:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Restart Windows, then verify that Ubuntu uses WSL version 2:
+
+```powershell
+wsl -l -v
+```
+
+### 2. Install Docker Desktop
+
+Install Docker Desktop and enable:
+
+- **Use the WSL 2 based engine**
+- **Resources → WSL Integration → Ubuntu-24.04**
+
+Open Ubuntu and verify that both the Docker client and server are available:
+
+```bash
+docker version
+```
+
+Allow at least 25 GB of free Windows disk space; 40 GB is recommended when
+building multiple OpenRA mods and platform images.
+
+### 3. Clone and install
+
+Run inside WSL Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv curl
+
+mkdir -p ~/Workspace
+cd ~/Workspace
+git clone --recurse-submodules https://github.com/1327483427/OpenRA-RL.git
+cd OpenRA-RL
+
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e .
+```
+
+### 4. Build and start the platform
+
+`Dockerfile.platform` automatically selects the correct gRPC build tools for
+x86_64 Windows machines and ARM64 Macs.
+
+```bash
+./scripts/build-platform.sh
+./scripts/start-platform.sh
+```
+
+Verify both the Web API and the OpenRA gRPC daemon:
+
+```bash
+curl http://127.0.0.1:8000/platform/status
+```
+
+A ready platform reports:
+
+```json
+{
+  "status": "ready",
+  "grpc_ok": true,
+  "map_count": 67
+}
+```
+
+Open the external-agent control center in the Windows browser:
+
+<http://127.0.0.1:8000/control>
+
+### 5. CC-Switch configuration on Windows
+
+CC-Switch runs on Windows while the MCP process runs inside WSL. Start it
+through `wsl.exe`; replace `YOUR_WSL_USER` with the result of `whoami` in
+Ubuntu, and adjust the distribution name if `wsl -l -v` shows a different one.
+
+```json
+{
+  "mcpServers": {
+    "openra-rl": {
+      "type": "stdio",
+      "command": "C:\\Windows\\System32\\wsl.exe",
+      "args": [
+        "-d",
+        "Ubuntu-24.04",
+        "--",
+        "env",
+        "OPENRA_AGENT_NAME=cc-switch",
+        "/home/YOUR_WSL_USER/Workspace/OpenRA-RL/.venv/bin/openra-rl",
+        "mcp-server",
+        "--server-url",
+        "http://127.0.0.1:8000"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+Suggested acceptance prompt:
+
+```text
+Use the openra-rl tools to list the installed maps. Start an easy game on
+tournament-island.oramap with seed 42, deploy the MCV, and stop after confirming
+that the fact construction yard exists.
+```
+
+### Daily operation
+
+Start the platform from WSL:
+
+```bash
+cd ~/Workspace/OpenRA-RL
+./scripts/start-platform.sh
+```
+
+Stop it with:
+
+```bash
+./scripts/stop-platform.sh
+```
+
+Rebuild after source changes:
+
+```bash
+./scripts/build-platform.sh
+./scripts/start-platform.sh
+```
+
+Replays persist under `.platform-data/replays/`. Do not copy `.venv`, Colima
+data, or an ARM64 Docker image from a Mac to an x86_64 Windows machine; clone
+the source and rebuild the image on Windows instead.
+
+## Roadmap: Red Alert 2 and More Countries
+
+The verified `ra` platform currently provides England, France, Germany,
+Russia, and Ukraine. The next content target is
+[Romanov's Vengeance](https://github.com/MustaphaTR/Romanovs-Vengeance), an
+OpenRA Red Alert 2 mod with fifteen selectable factions:
+
+- Allies: United States, England, France, Germany, and Korea
+- Soviets: Russia, Iraq, Vietnam, Cuba, and Libya
+- Psi-Corps: Yurigrad, Lazarus Corps, Antarctica, Fort Transylvania, and Lunar Eclipse
+
+The mod also defines additional non-selectable countries such as China, Japan,
+Australia, Poland, Canada, Mexico, Mongolia, and several Baku Pact factions.
+These require tech-tree and AI validation before being exposed as normal player
+choices.
+
+Recommended implementation sequence:
+
+1. Create a `codex/romanovs-vengeance` development branch.
+2. Import the mod as a separate content/engine target rather than replacing RA Classic.
+3. Port the gRPC AI bridge to the mod's OpenRA engine revision.
+4. Add `list_factions` and extend `start_game` with `mod` and `faction` parameters.
+5. Validate the fifteen default factions, their build orders, and special units.
+6. Enable hidden countries individually after their tech trees and AI behavior pass tests.
+7. Publish separate RA Classic and RA2 platform images.
+8. Add mod, country, and map selectors to the `/control` dashboard.
+
 ## Local Development (without Docker)
 
 For running the game server natively (macOS/Linux):
